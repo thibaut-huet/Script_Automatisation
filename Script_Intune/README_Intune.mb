@@ -1,0 +1,28 @@
+# Automatisation de l'inventaire du parc d'écrans
+
+## Contexte et problématique
+Dans le cadre d'une mission d'inventaire des actifs informatiques, le recensement manuel du matériel d'affichage (marque, modèle, numéro de série et taille) représentait une tâche particulièrement chronophage et sujette aux erreurs de saisie.
+
+## Solution mise en œuvre
+Afin d'optimiser cette procédure, j'ai mis en place, avec l'appui de mon RSI, une solution automatisée :
+
+* **Développement du script :** Conception d'un script PowerShell (avec l'assistance de l'IA Claude) permettant d'interroger les interfaces WMI/EDID des postes de travail pour extraire automatiquement les métadonnées des moniteurs connectés.
+* **Déploiement centralisé :** Packaging et déploiement du script à l'échelle du parc via Microsoft Intune (MDM).
+
+## Gestion des contraintes et défis techniques
+La mise en production a nécessité la résolution de deux défis techniques principaux :
+
+1. **Filtrage des écrans intégrés :** Exclusion des dalles d'ordinateurs portables afin de ne comptabiliser que les moniteurs externes.
+2. **Confidentialité et télétravail :** Réduction du périmètre de collecte pour ignorer le matériel personnel des collaborateurs à domicile.
+
+> **Solution retenue :** Intégration d'un contrôle d'environnement réseau dans le script (vérification du SSID Wi-Fi ou du domaine de l'entreprise) afin de restreindre le déclenchement du recensement aux seuls équipements connectés au réseau interne de l'organisation.
+
+---
+
+## Compétences SISR associées (Tableau synthétique E4 / E5)
+
+| Bloc de compétences | Réalisation associée |
+| :--- | :--- |
+| **Gérer le patrimoine informatique** | Recensement, suivi et mise à jour de la cartographie des actifs d'affichage. |
+| **Développer des scripts d'automatisation** | Écriture et adaptation de scripts PowerShell pour la collecte d'informations système (WMI/EDID). |
+| **Déployer des solutions d'administration** | Télé-distribution de configurations et de scripts à l'échelle du parc via une solution MDM (Microsoft Intune). |

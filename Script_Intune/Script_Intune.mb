@@ -1,0 +1,646 @@
+#Requires -Version 5.1
+# =====================================================================
+# Detect-Monitors.ps1 - ARTEFACT GENERE par Build-DetectionScript.ps1
+# Script de detection Intune AUTONOME (aucune dependance externe).
+# =====================================================================
+
+# =====================================================================
+# ETAPE 1 : Décodage EDID et gestion de la cartographie des fabricants
+# =====================================================================
+$scriptCsvDelimiter = ';'    # Délimiteur des fichiers de données (Excel FR)
+
+function ConvertFrom-EdidCharArray {
+    <#
+    .SYNOPSIS
+        Convertit un tableau d'entiers (uint16) issu de WmiMonitorID en chaîne.
+    .DESCRIPTION
+        WMI expose les champs texte de l'EDID (serial, modèle, code fabricant)
+        comme des tableaux d'entiers. Cette fonction filtre les caractères nuls
+        et non imprimables (hors ASCII 32-126), puis supprime les espaces de début/fin.
+        Retourne '' si l'entrée est nulle ou vide.
+    #>
+    param(
+        [Parameter(Position = 0)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [uint16[]]$Chars
+    )
+
+    if ($null -eq $Chars -or $Chars.Count -eq 0) { return '' }
+
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($c in $Chars) {
+        if ($c -ge 32 -and $c -le 126) {
+            [void]$sb.Append([char]$c)
+        }
+    }
+    return $sb.ToString().Trim()
+}
+
+function Import-ManufacturerMap {
+    <#
+    .SYNOPSIS
+        Charge la table code PNP (3 lettres) - nom fabricant depuis un CSV.
+    .DESCRIPTION
+        Repli gracieux : fichier absent, vide ou illisible -> table vide.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CsvPath
+    )
+
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $CsvPath)) { return $map }
+
+    try {
+        $rows = Import-Csv -LiteralPath $CsvPath -Delimiter $scriptCsvDelimiter -Encoding UTF8
+        foreach ($row in $rows) {
+            if ($row.Code -and $row.Fabricant) {
+                $map[$row.Code.Trim().ToUpperInvariant()] = $row.Fabricant.Trim()
+            }
+        }
+    }
+    catch {
+        return @{}
+    }
+
+    return $map
+}
+
+function Get-ManufacturerLabel {
+    <#
+    .SYNOPSIS
+        Traduit un code PNP en nom de fabricant lisible.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Code,
+        [hashtable]$Map = @{}
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Code)) { return 'Inconnu' }
+    $key = $Code.Trim().ToUpperInvariant()
+    if ($Map.ContainsKey($key)) { return $Map[$key] }
+    return $key
+}
+
+# =====================================================================
+# ETAPE 2 : Qualification des numéros de série et construction des objets
+# =====================================================================
+$scriptSuspectSerialPatterns = @(
+    '^.{1,2}$',                              # trop court (1-2 caractères)
+    '^(.)\1+$',                              # un seul caractère répété (000..., AAA...)
+    '^01234567890$',                         # suite 123456789 avec 0 optionnel
+    '^(unknown|none|default|serialnumber|demoset)$' # placeholders constructeur connus
+)
+$scriptAnneeMinPlausible = 1990               # année de fabrication minimale plausible
+
+function Get-SerialStatus {
+    param([AllowNull()][AllowEmptyString()][string]$Serial)
+
+    if ([string]::IsNullOrWhiteSpace($Serial)) { return 'VIDE' }
+    $s = $Serial.Trim()
+    foreach ($pattern in $scriptSuspectSerialPatterns) {
+        if ($s -match $pattern) { return 'SUSPECT' }
+    }
+    return 'OK'
+}
+
+function ConvertTo-MonitorRecords {
+    param(
+        [AllowNull()]$RawMonitors,
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$CollectDate,
+        [hashtable]$ManufacturerMap = @{}
+    )
+
+    $records = @()
+    $monitors = @($RawMonitors | Where-Object { $null -ne $_ })
+
+    if ($monitors.Count -eq 0) {
+        $records += [PSCustomObject][ordered]@{
+            Machine            = $ComputerName
+            Utilisateur        = $UserName
+            DateCollecte       = $CollectDate
+            IndexEcran         = 0
+            CodeFabricant      = ''
+            Fabricant          = ''
+            Modele             = ''
+            Serial             = ''
+            StatutSerial       = 'AUCUN_ECRAN'
+            AnneeFabrication   = ''
+            InstanceName       = ''
+            PresentDernierScan = ''
+            DernierVu          = ''
+        }
+        return $records
+    }
+
+    $i = 0
+    foreach ($m in $monitors) {
+        $i++
+        $code   = ConvertFrom-EdidCharArray $m.ManufacturerName
+        $serial = ConvertFrom-EdidCharArray $m.SerialNumberID
+        $annee  = ''
+
+        if ($m.YearOfManufacture -and [int]$m.YearOfManufacture -ge $scriptAnneeMinPlausible) {
+            $annee = [string][int]$m.YearOfManufacture
+        }
+
+        $records += [PSCustomObject][ordered]@{
+            Machine            = $ComputerName
+            Utilisateur        = $UserName
+            DateCollecte       = $CollectDate
+            IndexEcran         = $i
+            CodeFabricant      = $code
+            Fabricant          = (Get-ManufacturerLabel -Code $code -Map $ManufacturerMap)
+            Modele             = (ConvertFrom-EdidCharArray $m.UserFriendlyName)
+            Serial             = $serial
+            StatutSerial       = (Get-SerialStatus $serial)
+            AnneeFabrication   = $annee
+            InstanceName       = [string]$m.InstanceName
+            PresentDernierScan = 'Oui'
+            DernierVu          = $CollectDate
+        }
+    }
+
+    return $records
+}
+
+# =====================================================================
+# ETAPE 3 : Fusion des données de collecte CSV
+# =====================================================================
+$scriptMonitorCsvColumns = @(
+    'Machine', 'Utilisateur', 'DateCollecte', 'IndexEcran',
+    'CodeFabricant', 'Fabricant', 'Modele', 'Serial', 'StatutSerial',
+    'AnneeFabrication', 'InstanceName', 'PresentDernierScan', 'DernierVu'
+)
+$scriptMonitorCsvColumnsLegacy = @(
+    'Machine', 'Utilisateur', 'DateCollecte', 'IndexEcran',
+    'CodeFabricant', 'Fabricant', 'Modele', 'Serial', 'StatutSerial',
+    'AnneeFabrication', 'InstanceName'
+)
+
+function Merge-MonitorCsvRows {
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$CsvPaths,
+        [Parameter(Mandatory)][string[]]$ExpectedColumns,
+        [string]$Delimiter = ';'
+    )
+
+    $rows = @()
+    $ignored = @()
+
+    foreach ($p in @($CsvPaths | Where-Object { $_ })) {
+        try {
+            $data = @(Import-Csv -LiteralPath $p -Delimiter $Delimiter -Encoding UTF8)
+            if ($data.Count -eq 0) {
+                $ignored += [PSCustomObject]@{ Path = $p; Raison = 'vide' }
+                continue
+            }
+
+            $cols = @($data[0].PSObject.Properties.Name)
+            if (($cols -join ',') -ceq ($ExpectedColumns -join ',')) {
+                $rows += $data
+            }
+            elseif (($cols -join ',') -ceq ($scriptMonitorCsvColumnsLegacy -join ',')) {
+                foreach ($d in $data) {
+                    $rows += [PSCustomObject][ordered]@{
+                        Machine            = $d.Machine
+                        Utilisateur        = $d.Utilisateur
+                        DateCollecte       = $d.DateCollecte
+                        IndexEcran         = $d.IndexEcran
+                        CodeFabricant      = $d.CodeFabricant
+                        Fabricant          = $d.Fabricant
+                        Modele             = $d.Modele
+                        Serial             = $d.Serial
+                        StatutSerial       = $d.StatutSerial
+                        AnneeFabrication   = $d.AnneeFabrication
+                        InstanceName       = $d.InstanceName
+                        PresentDernierScan = 'Oui'
+                        DernierVu          = $d.DateCollecte
+                    }
+                }
+            }
+            else {
+                $ignored += [PSCustomObject]@{ Path = $p; Raison = 'colonnes non conformes' }
+            }
+        }
+        catch {
+            $ignored += [PSCustomObject]@{ Path = $p; Raison = ('illisible : ' + $_.Exception.Message) }
+        }
+    }
+
+    return @{ Rows = $rows; Ignored = $ignored }
+}
+
+# =====================================================================
+# ETAPE 4 : Sérialisation compacte JSON pour Microsoft Intune (Remediation)
+# =====================================================================
+$scriptCompactMaxLength = 2048
+
+function ConvertTo-CompactPayload {
+    param(
+        [AllowNull()]$Records,
+        [int]$MaxLength = $scriptCompactMaxLength
+    )
+
+    $recs = @($Records | Where-Object { $_ })
+    $machine = ''; $user = ''; $date = ''
+
+    if ($recs.Count -gt 0) {
+        $machine = [string]$recs[0].Machine
+        $user    = [string]$recs[0].Utilisateur
+        $date    = [string]$recs[0].DateCollecte
+    }
+
+    $niveaux = @(
+        @{ Model = $true;  Year = $true;  LastSeen = $true },
+        @{ Model = $false; Year = $true;  LastSeen = $true },
+        @{ Model = $false; Year = $false; LastSeen = $true },
+        @{ Model = $false; Year = $false; LastSeen = $false }
+    )
+
+    foreach ($n in $niveaux) {
+        $ecrans = @()
+        foreach ($r in $recs) {
+            $o = [ordered]@{
+                i = [int]$r.IndexEcran
+                c = [string]$r.CodeFabricant
+                s = [string]$r.Serial
+                t = [string]$r.StatutSerial
+            }
+            if ($n.Model) { $o['o'] = [string]$r.Modele }
+            if ($n.Year)  { $o['y'] = [string]$r.AnneeFabrication }
+            if ($r.PSObject.Properties['DernierVu'] -and $n.LastSeen) { $o['l'] = [string]$r.DernierVu }
+            if ($r.PSObject.Properties['PresentDernierScan']) {
+                $o['p'] = if (([string]$r.PresentDernierScan) -eq 'Oui') { 1 } else { 0 }
+            }
+            $ecrans += [PSCustomObject]$o
+        }
+
+        $obj = [PSCustomObject][ordered]@{ m = $machine; u = $user; d = $date; e = @($ecrans) }
+        $json = ConvertTo-Json -InputObject $obj -Compress -Depth 5
+        if ($json.Length -le $MaxLength) { return $json }
+    }
+
+    $fallback = [PSCustomObject][ordered]@{
+        m = $machine; u = $user; d = $date; e = @()
+        warn = ('TRUNCATED{0}' -f $recs.Count)
+    }
+    $json = ConvertTo-Json -InputObject $fallback -Compress -Depth 5
+    if ($json.Length -gt $MaxLength) { $json = $json.Substring(0, $MaxLength) }
+    return $json
+}
+
+function Expand-IntunePayload {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Json,
+        [hashtable]$ManufacturerMap = @{}
+    )
+
+    $rows = @()
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $rows }
+
+    try { $o = $Json | ConvertFrom-Json } catch { return $rows }
+
+    $machine = [string]$o.m
+    $user    = [string]$o.u
+    $date    = [string]$o.d
+    $ecrans  = @($o.e | Where-Object { $null -ne $_ })
+
+    if ($ecrans.Count -eq 0) {
+        $statut = if ($o.PSObject.Properties['warn']) { 'TRONQUE' } else { 'AUCUN_ECRAN' }
+        $rows += [PSCustomObject][ordered]@{
+            Machine            = $machine
+            Utilisateur        = $user
+            DateCollecte       = $date
+            IndexEcran         = 0
+            CodeFabricant      = ''
+            Fabricant          = ''
+            Modele             = ''
+            Serial             = ''
+            StatutSerial       = $statut
+            AnneeFabrication   = ''
+            InstanceName       = ''
+            PresentDernierScan = ''
+            DernierVu          = ''
+        }
+        return $rows
+    }
+
+    foreach ($e in $ecrans) {
+        $code = [string]$e.c
+        $present = 'Oui'
+        if ($e.PSObject.Properties['p']) { $present = if ([int]$e.p -eq 1) { 'Oui' } else { 'Non' } }
+        $dernierVu = if ($e.PSObject.Properties['l']) { [string]$e.l } else { $date }
+
+        $rows += [PSCustomObject][ordered]@{
+            Machine            = $machine
+            Utilisateur        = $user
+            DateCollecte       = $date
+            IndexEcran         = [int]$e.i
+            CodeFabricant      = $code
+            Fabricant          = (Get-ManufacturerLabel -Code $code -Map $ManufacturerMap)
+            Modele             = [string]$e.o
+            Serial             = [string]$e.s
+            StatutSerial       = [string]$e.t
+            AnneeFabrication   = [string]$e.y
+            InstanceName       = ''
+            PresentDernierScan = $present
+            DernierVu          = $dernierVu
+        }
+    }
+
+    return $rows
+}
+
+function Import-IntuneExport {
+    param(
+        [Parameter(Mandatory)][string]$CsvPath,
+        [hashtable]$ManufacturerMap = @{},
+        [string[]]$Delimiters = @(',', ';')
+    )
+
+    $result = @{ Rows = @(); Parsed = 0; Failed = 0; Column = '' }
+    if (-not (Test-Path -LiteralPath $CsvPath)) { return $result }
+
+    $data = $null
+    $colonne = ''
+
+    foreach ($d in $Delimiters) {
+        try { $essai = @(Import-Csv -LiteralPath $CsvPath -Delimiter $d) } catch { continue }
+        if ($essai.Count -eq 0) { continue }
+
+        foreach ($c in @($essai[0].PSObject.Properties.Name)) {
+            foreach ($r in $essai) {
+                if (([string]$r.$c) -match '^\s*\{"m":') { $colonne = $c; break }
+            }
+            if ($colonne) { break }
+        }
+        if ($colonne) { $data = $essai; break }
+    }
+
+    if (-not $data) { return $result }
+    $result.Column = $colonne
+
+    foreach ($r in $data) {
+        $payload = [string]$r.$colonne
+        if ($payload -notmatch '^\s*\{"m":') { continue }
+        $exp = @(Expand-IntunePayload -Json $payload -ManufacturerMap $ManufacturerMap)
+        if ($exp.Count -gt 0) {
+            $result.Rows += $exp
+            $result.Parsed++
+        } else {
+            $result.Failed++
+        }
+    }
+
+    return $result
+}
+
+# =====================================================================
+# ETAPE 5 : Accumulation et persistance du cache local
+# =====================================================================
+$scriptCacheExpirationJours = 90
+
+function Get-MonitorKey {
+    param([Parameter(Mandatory)]$Record)
+
+    $serial = [string]$Record.Serial
+    if (-not [string]::IsNullOrWhiteSpace($serial)) {
+        return ('{0}{1}' -f [string]$Record.CodeFabricant, $serial.Trim())
+    }
+
+    $inst = [string]$Record.InstanceName
+    if (-not [string]::IsNullOrWhiteSpace($inst)) {
+        return ('INST{0}' -f $inst.Trim())
+    }
+
+    return ('{0}{1}{2}' -f [string]$Record.CodeFabricant, [string]$Record.Modele, [string]$Record.IndexEcran)
+}
+
+function Merge-MonitorCache {
+    param(
+        [AllowNull()]$CurrentRecords,
+        [AllowNull()]$Cache,
+        [Parameter(Mandatory)][string]$Now,
+        [int]$ExpirationDays = $scriptCacheExpirationJours
+    )
+
+    $byKey = [ordered]@{}
+
+    foreach ($e in @($Cache | Where-Object { $_ })) {
+        $k = [string]$e.Key
+        if (-not $k) { continue }
+
+        $byKey[$k] = [PSCustomObject][ordered]@{
+            Key                = $k
+            IndexEcran         = [int]$e.IndexEcran
+            CodeFabricant      = [string]$e.CodeFabricant
+            Fabricant          = [string]$e.Fabricant
+            Modele             = [string]$e.Modele
+            Serial             = [string]$e.Serial
+            StatutSerial       = [string]$e.StatutSerial
+            AnneeFabrication   = [string]$e.AnneeFabrication
+            InstanceName       = [string]$e.InstanceName
+            PremierVu          = [string]$e.PremierVu
+            DernierVu          = [string]$e.DernierVu
+            PresentDernierScan = 'Non'
+        }
+    }
+
+    $courants = @($CurrentRecords | Where-Object {
+        $_ -and ([int]$_.IndexEcran) -gt 0 -and
+        @('AUCUN_ECRAN', 'ERREUR_WMI') -notcontains ([string]$_.StatutSerial)
+    })
+
+    foreach ($r in $courants) {
+        $key = Get-MonitorKey -Record $r
+        $premierVu = $Now
+        if ($byKey.Contains($key) -and $byKey[$key].PremierVu) {
+            $premierVu = [string]$byKey[$key].PremierVu
+        }
+
+        $byKey[$key] = [PSCustomObject][ordered]@{
+            Key                = $key
+            IndexEcran         = [int]$r.IndexEcran
+            CodeFabricant      = [string]$r.CodeFabricant
+            Fabricant          = [string]$r.Fabricant
+            Modele             = [string]$r.Modele
+            Serial             = [string]$r.Serial
+            StatutSerial       = [string]$r.StatutSerial
+            AnneeFabrication   = [string]$r.AnneeFabrication
+            InstanceName       = [string]$r.InstanceName
+            PremierVu          = $premierVu
+            DernierVu          = $Now
+            PresentDernierScan = 'Oui'
+        }
+    }
+
+    $limite = $null
+    if ($ExpirationDays -gt 0) {
+        try {
+            $limite = ([datetime]::ParseExact($Now, 'yyyy-MM-dd HHmmss', $null)).AddDays(-1 * $ExpirationDays)
+        } catch {
+            $limite = $null
+        }
+    }
+
+    $result = @()
+    foreach ($e in $byKey.Values) {
+        if ($null -ne $limite) {
+            $dv = $null
+            try { $dv = [datetime]::ParseExact([string]$e.DernierVu, 'yyyy-MM-dd HHmmss', $null) } catch { $dv = $null }
+            if ($null -ne $dv -and $dv -lt $limite) { continue }
+        }
+        $result += $e
+    }
+
+    return @($result | Sort-Object @{ Expression = { [int]$_.IndexEcran } }, Key)
+}
+
+function Get-MonitorCachePath {
+    if ($env:SCREEN_INV_CACHE) { return $env:SCREEN_INV_CACHE }
+
+    foreach ($base in @($env:LOCALAPPDATA, $env:ProgramData)) {
+        if (-not $base) { continue }
+        $dir = Join-Path $base 'ScreenInventory'
+        try {
+            if (-not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+            }
+            return (Join-Path $dir 'monitors.json')
+        } catch { continue }
+    }
+
+    return (Join-Path $env:TEMP 'ScreenInventory_monitors.json')
+}
+
+function Import-MonitorCache {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        $obj = $raw | ConvertFrom-Json
+
+        if ($obj -and $obj.PSObject.Properties['entries']) {
+            return @($obj.entries | Where-Object { $_ })
+        }
+        return @($obj | Where-Object { $_ })
+    } catch { return @() }
+}
+
+function Export-MonitorCache {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [AllowNull()]$Cache
+    )
+
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+        }
+
+        $wrapper = [PSCustomObject]@{ entries = @($Cache | Where-Object { $_ }) }
+        $json = ConvertTo-Json -InputObject $wrapper -Depth 6
+        Set-Content -LiteralPath $Path -Value $json -Encoding UTF8 -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+# =====================================================================
+# ETAPE 6 : Contrôle de l'environnement réseau (Filtre SSID Entreprise)
+# =====================================================================
+# REMPLACÉ : Nom de SSID générique pour la publication publique
+$scriptCorporateSsid = 'CORPORATE_WIFI_SSID'
+
+function Get-WifiSsidFromNetsh {
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+
+    $ssids = @()
+    if ([string]::IsNullOrEmpty($Text)) { return $ssids }
+
+    foreach ($line in ($Text -split "`r`n")) {
+        $m = [regex]::Match($line, '^\s*SSID\s*:\s*(.+)\s*$')
+        if ($m.Success) { $ssids += $m.Groups[1].Value }
+    }
+    return $ssids
+}
+
+function Get-CurrentWifiSsids {
+    try {
+        $out = (& netsh wlan show interfaces 2>$null | Out-String)
+        return @(Get-WifiSsidFromNetsh -Text $out)
+    } catch { return @() }
+}
+
+function Test-OnCorporateWifi {
+    param(
+        [string]$Ssid = $scriptCorporateSsid,
+        [AllowNull()]$Ssids = $null
+    )
+
+    if ($null -eq $Ssids) { $Ssids = Get-CurrentWifiSsids }
+    return (@($Ssids) -contains $Ssid)
+}
+
+# =====================================================================
+# ETAPE 7 : Déclencheur principal et émission des données vers Intune
+# =====================================================================
+$now = Get-Date -Format 'yyyy-MM-dd HHmmss'
+$ctx = @{
+    ComputerName = $env:COMPUTERNAME
+    UserName     = $env:USERNAME
+    CollectDate  = $now
+}
+
+$cachePath = Get-MonitorCachePath
+$cache     = @(Import-MonitorCache -Path $cachePath)
+
+if (Test-OnCorporateWifi) {
+    # Présent sur le Wi-Fi de l'entreprise : interrogation WMI + mise à jour du cache
+    $raw = $null
+    try {
+        $raw = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop)
+    } catch {
+        $raw = $null
+    }
+
+    $records = @(ConvertTo-MonitorRecords -RawMonitors $raw @ctx)
+    $cache   = @(Merge-MonitorCache -CurrentRecords $records -Cache $cache -Now $now)
+    [void](Export-MonitorCache -Path $cachePath -Cache $cache)
+} 
+elseif ($cache.Count -eq 0) {
+    # Hors du réseau entreprise ET aucun inventaire antérieur : interruption silencieuse
+    exit 0
+}
+
+# Restitution du dernier inventaire connu (réémission pour conserver l'historique dans Intune)
+$payloadRecs = @()
+foreach ($e in $cache) {
+    $payloadRecs += [PSCustomObject][ordered]@{
+        Machine            = $env:COMPUTERNAME
+        Utilisateur        = $env:USERNAME
+        DateCollecte       = $now
+        IndexEcran         = $e.IndexEcran
+        CodeFabricant      = $e.CodeFabricant
+        Fabricant          = $e.Fabricant
+        Modele             = $e.Modele
+        Serial             = $e.Serial
+        StatutSerial       = $e.StatutSerial
+        AnneeFabrication   = $e.AnneeFabrication
+        InstanceName       = $e.InstanceName
+        DernierVu          = $e.DernierVu
+        PresentDernierScan = $e.PresentDernierScan
+    }
+}
+
+if ($payloadRecs.Count -eq 0) {
+    $payloadRecs = @(ConvertTo-MonitorRecords -RawMonitors $null @ctx)
+}
+
+Write-Output (ConvertTo-CompactPayload -Records $payloadRecs)
+exit 0
